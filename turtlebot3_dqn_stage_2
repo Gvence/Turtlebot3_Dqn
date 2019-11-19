@@ -1,0 +1,378 @@
+#!/usr/bin/env python
+#coding:utf-8
+#################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#################################################################################
+
+# Authors: Gilbert #
+
+import rospy
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+np.set_printoptions(threshold = np.inf)
+import random
+import time
+import sys
+import codecs
+import csv
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+path = os.getcwd()
+from collections import deque
+from std_msgs.msg import Float32MultiArray, String
+from src.turtlebot3_dqn.environment_stage_2 import Env
+from keras.models import Sequential, load_model, Model
+from keras.optimizers import RMSprop
+from keras.layers.core import Dense, Dropout, Activation
+from keras.layers import LSTM,TimeDistributed, Input, Embedding, Dense, Convolution1D, merge, MaxPool1D,Flatten, Reshape
+from keras.layers import BatchNormalization
+import keras as keras
+from keras.callbacks import ReduceLROnPlateau
+
+EPISODES = 300000
+
+
+
+class ReinforceAgent():
+    def __init__(self, state_size, action_size, fieldnames):
+        self.fieldnames = fieldnames
+        self.csv_path = path + '/data.csv'
+        self.pub_result = rospy.Publisher('result', Float32MultiArray, queue_size=5)
+        self.dirPath = path.replace('turtlebot3_dqn/nodes', 'turtlebot3_dqn/save_model/stage_2_')
+        self.result = Float32MultiArray()
+        self.dis_pre_list = []
+        self.dis_lable_list = []
+        self.time_step = 50
+        self.distance_size = 1
+        self.load_model = False
+        self.load_episode = 0
+        self.state_size = state_size
+        self.aux_size = 3
+        self.action_size = action_size
+        self.episode_step = 500
+        self.discount_factor = 0.9
+        self.learning_rate = 0.001
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.96
+        self.epsilon_min = 0.10
+        self.batch_size = 50
+        self.train_start = self.batch_size * self.time_step *2
+        self.target_update = 1000
+        self.memory = deque(maxlen= 50000)
+        self.model = self.CRNNModel()
+        self.target_model = self.CRNNModel()
+
+        self.updateTargetModel()
+
+        if self.load_model:
+            print ('loading  .h5...')
+            self.model.set_weights(load_model(self.dirPath + str(self.load_episode) + ".h5").get_weights())
+            print ('loading .json...')
+            with open(self.dirPath + str(self.load_episode) + '.json') as outfile:
+                param = json.load(outfile)
+                self.epsilon = param.get('epsilon')
+
+    # CSV init
+    def initCSV(self):
+        with open(self.csv_path, "wb") as csv_file:
+            csv_file.write(codecs.BOM_UTF8)
+            csv_writer = csv.DictWriter(csv_file, fieldnames=self.fieldnames)
+            csv_writer.writeheader()
+            csv_file.close()
+
+    # CSV reader
+    # def read_csv (csv_file_path):
+
+    # CSV writer
+    def write_csv(self, data, fieldnames):
+        with open(self.csv_path, "ab") as csv_file:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=self.fieldnames)
+            csv_writer.writerow({fieldnames[0]: data[0],fieldnames[1]: data[1],fieldnames[2]: data[2],
+                                  fieldnames[3]: data[3],fieldnames[4]: data[4]})
+            csv_file.close()
+    def saveMemory(self):
+        rospy.loginfo("Saving Memory.")
+        self.initCSV()
+        self.write_csv(np.array(self.memory)[:, 0], "state")
+        self.write_csv(np.array(self.memory)[:, 1], "action")
+        self.write_csv(np.array(self.memory)[:, 2], "reward")
+        self.write_csv(np.array(self.memory)[:, 3], "next_state")
+        self.write_csv(np.array(self.memory)[:, 4], "done")
+
+    def buildModel(self):
+        model = Sequential()
+        dropout = 0.1
+        model.add(LSTM(units=64,input_shape=(self.time_step, self.state_size)))
+        model.add(Dense(64, activation='relu', kernel_initializer='lecun_uniform'))
+        model.add(Dropout(dropout))
+        model.add(Dense(64, activation='relu', kernel_initializer='lecun_uniform'))
+        model.add(Dense(self.action_size, kernel_initializer='lecun_uniform'))
+        model.add(Activation('linear'))
+        model.compile(loss='mse', optimizer=RMSprop(lr=self.learning_rate, rho=0.9, epsilon=1e-06))
+        model.summary()
+
+        return model
+
+    def CRNNModel(self):
+        # Cnn输入入口 连续time_step 个state
+        Cnn_input = Input(shape = (self.time_step, self.state_size), dtype='float32', name='Cnn_input')
+        x = Dense(128, activation='relu')(Cnn_input)
+        x = Dense(64, activation='relu')(x)
+        auxiliary_output = Dense(1, activation='relu',name='aux_output')(x)
+        auxiliary_input = Input(shape=(self.time_step,self.aux_size), dtype='float32', name='aux_input')
+        Rnn_input = keras.layers.concatenate([auxiliary_input, Cnn_input])
+        Rnn_input = Dense(128, activation='relu')(Rnn_input)
+        Rnn_input = Dense(64, activation='relu')(Rnn_input)
+        Rnn_input = Dense(16, activation='relu')(Rnn_input)
+        Final_out = LSTM(5, activation='relu',)(Rnn_input)
+        Final_out = Dense(5, activation='linear', name='final_output')(Final_out)
+        model = Model(inputs = [Cnn_input, auxiliary_input], outputs = [Final_out, auxiliary_output])
+        model.compile(loss='mse', optimizer=RMSprop(lr=self.learning_rate, rho=0.9, epsilon=1e-06))
+        model.summary()
+
+        return model
+    def getQvalue(self, reward, next_target, done):
+        if done:
+            return reward
+        else:
+            return reward + self.discount_factor * np.amax(next_target)
+
+    def updateTargetModel(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+    def getAction(self, state,dis):
+        if np.random.rand() <= self.epsilon or len(self.memory) < self.train_start:
+            self.q_value = np.zeros(self.action_size)
+            R = random.randrange(self.action_size)
+            self.q_value[R] = 5
+            return R
+        else:
+            states = np.array(state)[:,:-self.aux_size]
+            aux_in = np.array(state)[:,-self.aux_size:]
+            distance = np.array(dis)[:]
+            q_value = self.model.predict({'Cnn_input': states.reshape((-1,self.time_step, self.state_size)),
+                                          'aux_input': aux_in.reshape((-1,self.time_step, self.aux_size))})
+
+            self.dis_pre_list.append(np.array(q_value[1][0])[-1])
+            self.dis_lable_list.append(np.array(distance)[-1])
+            self.q_value = q_value[0][0]
+            return np.argmax(q_value[0][0])
+
+    def appendMemory(self, data):
+        self.memory.append(data)
+
+    def trainModel(self, target=False):
+        #mini_batch = random.sample(self.memory, self.batch_size)
+        batch_index = np.random.randint(0,(len(self.memory) - self.time_step),self.batch_size)
+        X_batch = np.empty((0,self.time_step,self.state_size),dtype=np.float32)
+        Y_batch = np.empty((0,self.action_size),dtype=np.float32)
+        A_batch = np.empty((0,self.time_step,self.aux_size),dtype=np.float32)
+        A_sample = np.empty((0,self.distance_size),dtype=np.float32)
+        for i in batch_index:
+            states = np.empty((0,self.state_size),dtype=np.float32)
+            aux_in = np.empty((0,self.aux_size),dtype=np.float32)
+            next_states = np.empty((0,self.state_size),dtype=np.float32)
+            next_aux_in = np.empty((0,self.aux_size),dtype=np.float32)
+
+            for j in range(0,self.time_step):
+                states = np.append(states, np.array(self.memory[i + j][0])[:-self.aux_size])
+                aux_in = np.append(aux_in, np.array(self.memory[i + j][0])[-self.aux_size:])
+                A_sample = np.append(A_sample, [self.memory[i + j][4]])
+                next_states = np.append(next_states, [np.array(self.memory[i + j][3])[:-self.aux_size]])
+                next_aux_in = np.append(next_aux_in, [np.array(self.memory[i + j][3])[-self.aux_size:]])
+            action = self.memory[i + self.time_step - 1][1] # 取每个状态序列的最后一个状态作当前状态
+            reward = self.memory[i + self.time_step - 1][2]
+            done = self.memory[i + self.time_step - 1][5]
+            q_value = self.model.predict({'Cnn_input': states.reshape((-1, self.time_step, self.state_size)),
+                                          'aux_input': aux_in.reshape((-1, self.time_step, self.aux_size))})
+            q_value = q_value[0][0]
+
+            if target:
+                next_target = self.target_model.predict({'Cnn_input': next_states.reshape((-1, self.time_step, self.state_size)),
+                                                        'aux_input': next_aux_in.reshape((-1, self.time_step, self.aux_size))})
+                next_target = next_target[0][0]
+            else:
+                next_target = self.model.predict({'Cnn_input': next_states.reshape((-1, self.time_step, self.state_size)),
+                                                  'aux_input': next_aux_in.reshape((-1, self.time_step, self.aux_size))})
+                next_target = next_target[0][0]
+            next_q_value = self.getQvalue(reward, next_target, done)
+
+            X_batch = np.append(X_batch, states.reshape((self.time_step,self.state_size))[:,:self.state_size])
+            A_batch = np.append(A_batch, aux_in.reshape((self.time_step,self.aux_size))[:,:self.aux_size])
+            Y_sample = q_value.copy()
+            Y_sample[action] = next_q_value  # 用target的预测Q值替换当前情况下执行actions获得的下一个动作的Q值
+            Y_batch = np.append(Y_batch, np.array((Y_sample)))
+        reduce_lr = ReduceLROnPlateau(monitor='final_output_loss', patience=1, factor=0.5,min_lr=0.0001)
+        self.history = self.model.fit({'Cnn_input': X_batch.reshape((-1,self.time_step,self.state_size)),
+                        'aux_input':A_batch.reshape((-1,self.time_step,self.aux_size)) },
+                       {'final_output': Y_batch.reshape((-1,self.action_size)),
+                        'aux_output': A_sample.reshape((-1,self.time_step,self.distance_size))},
+                       batch_size=self.batch_size,epochs=1,verbose=0,callbacks=[reduce_lr])
+
+stop = False
+def callback(key):
+    global stop
+    if 't' in 'data: "t"':
+        print (key)
+        stop = True
+
+if __name__ == '__main__':
+    rospy.init_node('turtlebot3_dqn_stage_2')
+    pub_result = rospy.Publisher('result', Float32MultiArray, queue_size=5)
+    pub_get_action = rospy.Publisher('get_action', Float32MultiArray, queue_size=5)
+    rospy.Subscriber('keys', String, callback)
+    result = Float32MultiArray()
+    get_action = Float32MultiArray()
+
+    state_size = 360
+    action_size = 5 #w a d x s
+
+    env = Env(action_size)
+    #state : "scan_range" 360, "heading" 1,  "obstacle_min_range" 1, "obstacle_angle" 1, "reward" 1= 364
+    csv_header = ["state", "action", "reward","next_state","goal_distance","done"]
+    agent = ReinforceAgent(state_size, action_size,csv_header)
+    print ("CSV will save in ： %s" %(agent.csv_path))
+    print ("Current pattn is ： %s" % (agent.dirPath))
+    scores, episodes = [], []
+    global_step = 0
+    start_time = time.time()
+    states = deque(maxlen=agent.time_step)
+    diss = deque(maxlen=agent.time_step)
+    plt.ion()
+    plt.show()
+    fig = plt.figure(1,figsize=(24,12),dpi=80)
+    dis_pre_list = []
+    dis_lable_list = []
+    loss_list = []
+    aux_loss_list = []
+    reward_list = []
+    score_list = []
+    q_list = []
+    for e in range(agent.load_episode + 1, EPISODES):
+        if stop:
+            agent.initCSV()
+            rospy.loginfo("Saving Memory.")
+            for i in agent.memory:
+                agent.write_csv(np.array(i), csv_header)
+            rospy.loginfo("Memory Saved at %s"%(agent.csv_path))
+            break
+        done_times = 0
+        done = False
+        state,goal_distance = env.reset()
+        states.append(state)
+        diss.append(goal_distance)
+        score = 0
+        sum_q_value = 0
+        for t in range(1, agent.episode_step):
+            action = agent.getAction(states,diss)
+
+            next_state, reward, goal_distance,done = env.step(action,t)
+
+            agent.appendMemory([state, action,reward,next_state, goal_distance,done])
+            if len(agent.memory) >= agent.train_start:
+
+                if global_step <= agent.target_update:
+                    agent.trainModel()
+
+                else:
+                    agent.trainModel(True)
+                loss = agent.history.history['final_output_loss']
+                aux_loss = agent.history.history['aux_output_loss']
+                loss_list.append(loss)
+                aux_loss_list.append(aux_loss)
+                    # print  agent.history.history['final_output_loss']
+                    # print  agent.history.history['aux_output_loss']
+                    # print  agent.history.history['lr']
+
+            score += reward
+            states.append(next_state)
+            diss.append(goal_distance)
+            sum_q_value += np.max(agent.q_value)
+            dis_pre_list = agent.dis_pre_list
+            dis_lable_list = agent.dis_lable_list
+
+            reward_list.append(reward)
+            score_list.append(score)
+            q_list.append(np.max(agent.q_value))
+
+
+            # _done = done
+            # if t == agent.episode_step - 1:
+            #     _done = 1
+            # get_action.data = [action, reward, _done]
+            # pub_get_action.publish(get_action)
+            global_step += 1
+            if global_step % agent.target_update == 0:
+                agent.updateTargetModel()
+                rospy.loginfo("UPDATE TARGET NETWORK")
+
+            if done or t == agent.episode_step - 1:
+                result.data = [score, sum_q_value/(t*1.0)]
+                pub_result.publish(result)
+                env.get_getgoal_step = 0 #判定为失败时，重置到达BOX时的步数
+                scores.append(score)
+                episodes.append(e)
+                m, s = divmod(int(time.time() - start_time), 60)
+                h, m = divmod(m, 60)
+                rospy.loginfo('Ep: %d score: %.2f memory: %d epsilon: %.2f totalStep: %dtime: %d:%02d:%02d',
+                              e, score, len(agent.memory), agent.epsilon, t, h, m, s)
+                param_keys = ['epsilon']
+                param_values = [agent.epsilon]
+                param_dictionary = dict(zip(param_keys, param_values))
+                rospy.loginfo('Game Over Reset the Game')
+                break
+        plt.clf()
+        chart_1 = fig.add_subplot(3, 2, 1)
+        chart_1.set_title('Train_Loss')
+        chart_2 = fig.add_subplot(3, 2, 2)
+        chart_2.set_title('Reward')
+        chart_3 = fig.add_subplot(3, 2, 3)
+        chart_3.set_title('Score')
+        chart_4 = fig.add_subplot(3, 2, 4)
+        chart_4.set_title('Q')
+        chart_5 = fig.add_subplot(3, 2, 5)
+        chart_5.set_title('dis_pre&dis_lable')
+        chart_6 = fig.add_subplot(3, 2, 6)
+        chart_6.set_title('aux_loss')
+
+        chart_1.plot(np.arange(0, len(loss_list)), loss_list, 'r-', lw=2)
+        chart_2.plot(np.arange(0, len(reward_list)), reward_list, 'g-', lw=2)
+        chart_3.plot(np.arange(0, len(score_list)), score_list, 'b-', lw=2)
+        chart_4.plot(np.arange(0, len(q_list)), q_list, 'y-', lw=2)
+        chart_5.plot(np.arange(0, len(dis_lable_list)), dis_lable_list, 'b-', lw=2)
+        chart_5.plot(np.arange(0, len(dis_pre_list)), dis_pre_list, 'r-', lw=2)
+
+        chart_6.plot(np.arange(0, len(aux_loss_list)), aux_loss_list, 'r-', lw=2)
+        plt.pause(0.05)
+
+        if e % 100 == 0:
+            if not os.path.exists('plot'):
+                os.makedirs('plot')
+            plt.savefig('plot/Loss%s.png' % e)
+            agent.dis_lable_list = []
+            agent.dis_pre_list = []
+            loss_list = []
+            aux_loss_list = []
+            reward_list = []
+            score_list = []
+            q_list = []
+        if e % 10 == 0:
+            if agent.epsilon > agent.epsilon_min:
+                agent.epsilon *= agent.epsilon_decay
+            agent.model.save(str(agent.dirPath) + str(e) + '.h5')
+            with open(agent.dirPath + str(e) + '.json', 'w') as outfile:
+                json.dump(param_dictionary, outfile)
+    rospy.loginfo("stop!!")
